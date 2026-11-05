@@ -1,0 +1,8 @@
+bin/
+obj/
+logs/
+*.user
+wwwroot/uploads/**/*
+!wwwroot/uploads/**/
+!wwwroot/uploads/**/.gitkeep
+.vs/

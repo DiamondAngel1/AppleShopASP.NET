@@ -1,0 +1,7 @@
+﻿services:
+  appleshop:
+    image: appleshop
+    build:
+      context: .
+      dockerfile: Dockerfile
+
