@@ -246,7 +246,8 @@ var allowedOrigins = configuredOrigins is { Length: > 0 }
     :
     [
         "http://localhost:5173",
-        "http://localhost:3000"
+        "http://localhost:3000",
+        "https://apple-shop-blush.vercel.app"
     ];
 
 builder.Services.AddCors(options =>
