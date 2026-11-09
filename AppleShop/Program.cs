@@ -237,19 +237,25 @@ builder.Services
 builder.Services.AddAuthorization();
 
 // CORS
-var configuredOrigins = builder.Configuration
-    .GetSection(CorsOptions.SectionName)
-    .Get<CorsOptions>()?.AllowedOrigins;
+// 1. Беремо значення з конфігурації appsettings (для локальної роботи)
+var corsOriginsEnv = Environment.GetEnvironmentVariable("Cors__AllowedOrigins");
+string[] allowedOrigins;
 
-var allowedOrigins = configuredOrigins is { Length: > 0 }
-    ? configuredOrigins
-    :
-    [
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "https://apple-shop-blush.vercel.app"
-    ];
+if (!string.IsNullOrWhiteSpace(corsOriginsEnv))
+{
+    // Якщо запущено на Render, розбиваємо рядок з комами в масив
+    allowedOrigins = corsOriginsEnv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+}
+else
+{
+    // Локальний варіант за замовчуванням
+    var configuredOrigins = builder.Configuration.GetSection(CorsOptions.SectionName).Get<CorsOptions>()?.AllowedOrigins;
+    allowedOrigins = configuredOrigins is { Length: > 0 }
+        ? configuredOrigins
+        : ["http://localhost:5173", "http://localhost:3000", "https://apple-shop-blush.vercel.app/"];
+}
 
+// 2. Ініціалізуємо CORS політику
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("Frontend", policy =>
@@ -257,7 +263,8 @@ builder.Services.AddCors(options =>
         policy
             .WithOrigins(allowedOrigins)
             .AllowAnyHeader()
-            .AllowAnyMethod();
+            .AllowAnyMethod()
+            .AllowCredentials();
     });
 });
 
