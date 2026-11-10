@@ -1,20 +1,15 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using AppleShop.Middleware;
+using AppleShop.Options;
+using CloudinaryDotNet;
+using CloudinaryDotNet.Actions;
 
 namespace AppleShop.Services;
 
-using AppleShop.Middleware;
-using AppleShop.Options;
-using Microsoft.Extensions.Options;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats.Webp;
-using SixLabors.ImageSharp.Processing;
-
-public sealed class ImageService(
-    IOptions<StorageOptions> options,
-    IWebHostEnvironment environment,
-    ILogger<ImageService> logger) : IImageService
+public sealed class ImageService : IImageService
 {
     private const int MaxDimension = 1600;
     private const int ThumbnailSize = 400;
@@ -23,7 +18,28 @@ public sealed class ImageService(
     private static readonly string[] AllowedExtensions = [".jpg", ".jpeg", ".png", ".webp"];
     private static readonly string[] AllowedContentTypes = ["image/jpeg", "image/png", "image/webp"];
 
-    private readonly StorageOptions _storage = options.Value;
+    private readonly StorageOptions _storage;
+    private readonly ILogger<ImageService> _logger;
+    private readonly Cloudinary _cloudinary;
+
+    public ImageService(
+        IOptions<StorageOptions> options,
+        ILogger<ImageService> logger)
+    {
+        _storage = options.Value;
+        _logger = logger;
+
+        // Зчитуємо URL підключення з Environment Variables
+        var cloudinaryUrl = Environment.GetEnvironmentVariable("CLOUDINARY_URL");
+        if (string.IsNullOrWhiteSpace(cloudinaryUrl))
+        {
+            throw new InvalidOperationException("Не задано змінну оточення CLOUDINARY_URL.");
+        }
+
+        // Ініціалізуємо клієнт Cloudinary
+        _cloudinary = new Cloudinary(cloudinaryUrl);
+        _cloudinary.Api.Secure = true;
+    }
 
     public Task<StoredImage> SaveProductImageAsync(IFormFile file, CancellationToken ct = default) => SaveAsync(file, "products", false, ct);
     public Task<StoredImage> SaveCategoryImageAsync(IFormFile file, CancellationToken ct = default) => SaveAsync(file, "categories", false, ct);
@@ -35,21 +51,25 @@ public sealed class ImageService(
 
         try
         {
-            var relative = url.StartsWith(_storage.BaseUrl, StringComparison.OrdinalIgnoreCase)
-                ? url[_storage.BaseUrl.Length..]
-                : url;
+            // Витягуємо Public ID файлу з URL Cloudinary для його видалення
+            // Стрічка виду: https://cloudinary.com
+            var uri = new Uri(url);
+            var segments = uri.Segments;
 
-            relative = relative.Split('?')[0];
+            // Нам потрібні останні сегменти (папка + ім'я файлу без розширення)
+            if (segments.Length >= 2)
+            {
+                var folder = segments[^2].TrimEnd('/');
+                var fileNameWithExtension = segments[^1];
+                var publicId = $"{folder}/{Path.GetFileNameWithoutExtension(fileNameWithExtension)}";
 
-            var root = GetRootPath();
-            var full = Path.GetFullPath(Path.Combine(root, relative.TrimStart('/', '\\')));
-
-            if (!full.StartsWith(Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase)) return;
-            if (File.Exists(full)) File.Delete(full);
+                var deleteParams = new DeletionParams(publicId);
+                _cloudinary.Destroy(deleteParams);
+            }
         }
         catch (Exception exception)
         {
-            logger.LogWarning(exception, "Failed to delete {Url}", url);
+            _logger.LogWarning(exception, "Failed to delete from Cloudinary: {Url}", url);
         }
     }
 
@@ -62,47 +82,41 @@ public sealed class ImageService(
         if (!AllowedExtensions.Contains(extension) || !AllowedContentTypes.Contains(file.ContentType.ToLowerInvariant()))
             throw new AppException("Дозволені формати: jpg, jpeg, png, webp.");
 
-        var directory = Path.Combine(GetRootPath(), folder);
-        Directory.CreateDirectory(directory);
-
         var name = Guid.NewGuid().ToString("N");
-        var url = $"{_storage.BaseUrl.TrimEnd('/')}/{folder}/{name}.webp";
 
-        await using var upload = file.OpenReadStream();
-        using var image = await Image.LoadAsync(upload, ct);
+        await using var stream = file.OpenReadStream();
+
+        var uploadParams = new ImageUploadParams
+        {
+            File = new FileDescription(name, stream),
+            PublicId = $"{folder}/{name}", // Файли будуть гарно розкладені по папках у хмарі
+            Format = "webp" // Примусово конвертуємо в оптимізований WebP формат
+        };
 
         if (isAvatar)
         {
-            image.Mutate(x => x.Resize(new ResizeOptions
-            {
-                Size = new Size(AvatarSize, AvatarSize),
-                Mode = ResizeMode.Crop,
-                Position = AnchorPositionMode.Center
-            }));
+            // Для аватарів робимо «розумне» обрізання по центру за допомогою штучного інтелекту хмари
+            uploadParams.Transformation = new Transformation()
+                .Width(AvatarSize).Height(AvatarSize).Crop("fill").Gravity("face");
 
-            await image.SaveAsWebpAsync(Path.Combine(directory, $"{name}.webp"), new WebpEncoder { Quality = 90 }, ct);
-            return new StoredImage(url, url);
+            var uploadResult = await _cloudinary.UploadAsync(uploadParams, ct);
+            if (uploadResult.Error != null) throw new AppException($"Помилка завантаження аватарки: {uploadResult.Error.Message}");
+
+            return new StoredImage(uploadResult.SecureUrl.ToString(), uploadResult.SecureUrl.ToString());
         }
 
-        using var main = image.Clone(x => x.Resize(new ResizeOptions { Size = new Size(MaxDimension, MaxDimension), Mode = ResizeMode.Max }));
-        using var thumb = image.Clone(x => x.Resize(new ResizeOptions { Size = new Size(ThumbnailSize, ThumbnailSize), Mode = ResizeMode.Max }));
+        // Для звичайних картинок товарів обмежуємо максимальну роздільну здатність
+        uploadParams.Transformation = new Transformation().Width(MaxDimension).Height(MaxDimension).Crop("limit");
 
-        await main.SaveAsWebpAsync(Path.Combine(directory, $"{name}.webp"), new WebpEncoder { Quality = 88 }, ct);
-        await thumb.SaveAsWebpAsync(Path.Combine(directory, $"{name}_thumb.webp"), new WebpEncoder { Quality = 82 }, ct);
+        var mainResult = await _cloudinary.UploadAsync(uploadParams, ct);
+        if (mainResult.Error != null) throw new AppException($"Помилка завантаження зображення: {mainResult.Error.Message}");
 
-        return new StoredImage(url, $"{_storage.BaseUrl.TrimEnd('/')}/{folder}/{name}_thumb.webp");
-    }
+        var mainUrl = mainResult.SecureUrl.ToString();
 
-    private string GetRootPath()
-    {
-        var root = _storage.RootPath;
-        if (Path.IsPathRooted(root)) return root;
+        // Створюємо посилання на Thumbnail (прев'ю) за допомогою вбудованих трансформацій Cloudinary на льоту
+        // Замість фізичного завантаження другого файлу, ми просто додаємо параметри зміни розміру в URL
+        var thumbUrl = mainUrl.Replace($"/upload/", $"/upload/c_limit,h_{ThumbnailSize},w_{ThumbnailSize}/");
 
-        var contentRoot = environment.ContentRootPath;
-        var webRoot = environment.WebRootPath ?? Path.Combine(contentRoot, "wwwroot");
-
-        return root.StartsWith("wwwroot", StringComparison.OrdinalIgnoreCase)
-            ? Path.Combine(contentRoot, root)
-            : Path.Combine(webRoot, root);
+        return new StoredImage(mainUrl, thumbUrl);
     }
 }
